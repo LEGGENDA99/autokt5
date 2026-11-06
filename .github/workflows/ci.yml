@@ -1,0 +1,90 @@
+name: Tests and Flaskr smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install uv
+          uv sync --frozen --no-default-groups --group tests --python "$(command -v python)"
+
+      - name: Run all tests
+        run: uv run --no-sync python -m pytest tests/
+
+  build-and-run:
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APP_VENV: ${{ runner.temp }}/flaskr-venv
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Save distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Install wheel and Flaskr in an isolated environment
+        run: |
+          python -m venv "$APP_VENV"
+          "$APP_VENV/bin/python" -m pip install --upgrade pip
+          "$APP_VENV/bin/python" -m pip install dist/*.whl
+          "$APP_VENV/bin/python" -m pip install --no-deps ./examples/tutorial
+          "$APP_VENV/bin/python" -m pip check
+
+      - name: Initialize Flaskr database
+        run: '"$APP_VENV/bin/python" -m flask --app flaskr init-db'
+
+      - name: Run Flaskr on port 5000 and check HTTP response
+        shell: bash
+        run: |
+          "$APP_VENV/bin/python" -m flask --app flaskr run --host 127.0.0.1 --port 5000 > "$RUNNER_TEMP/flaskr.log" 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true; cat "$RUNNER_TEMP/flaskr.log"' EXIT
+          curl --fail --show-error --silent \
+            --retry 15 --retry-connrefused --retry-delay 1 --max-time 5 \
+            http://127.0.0.1:5000/ > "$RUNNER_TEMP/flaskr-index.html"
+          kill -0 "$app_pid"
+          grep -q 'Flaskr' "$RUNNER_TEMP/flaskr-index.html"
